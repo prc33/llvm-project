@@ -10,9 +10,21 @@
 # RUN: rm -rf %t && mkdir -p %t
 # RUN: llvm-mc -triple=x86_64-unknown-linux -position-independent \
 # RUN:     -filetype=obj -o %t/ELF_x86-64_perf.o %s
-# RUN: env JITDUMPDIR="%t" llvm-jitlink -perf-support \
+# RUN: env JITDUMPDIR="%t" JITDUMP_USE_ARCH_TIMESTAMP=0 llvm-jitlink \
+# RUN:     -perf-support \
 # RUN:     %t/ELF_x86-64_perf.o
 # RUN: test -f %t/.debug/jit/llvm-IR-jit-*/jit-*.dump
+# RUN: od -An -tu8 -j 32 -N 8 \
+# RUN:     %t/.debug/jit/llvm-IR-jit-*/jit-*.dump | FileCheck %s --check-prefix=MONOTONIC
+# RUN: mkdir -p %t/arch
+# RUN: env JITDUMPDIR="%t/arch" JITDUMP_USE_ARCH_TIMESTAMP=1 \
+# RUN:     llvm-jitlink -perf-support %t/ELF_x86-64_perf.o
+# RUN: test -f %t/arch/.debug/jit/llvm-IR-jit-*/jit-*.dump
+# RUN: od -An -tu8 -j 32 -N 8 \
+# RUN:     %t/arch/.debug/jit/llvm-IR-jit-*/jit-*.dump | FileCheck %s --check-prefix=ARCH
+
+# MONOTONIC: 0
+# ARCH: 1
 
 # Test ELF perf support for code load records and unwind info
 

@@ -20,6 +20,7 @@
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Threading.h"
 
+#include <cstring>
 #include <mutex>
 #include <optional>
 
@@ -27,6 +28,10 @@
 
 #include <sys/mman.h> // mmap()
 #include <time.h>     // clock_gettime(), time(), localtime_r() */
+
+#if defined(__i386__) || defined(__x86_64__)
+#include <x86intrin.h>
+#endif
 
 #define DEBUG_TYPE "orc"
 
@@ -37,6 +42,10 @@
   ((uint32_t)'J' << 24 | (uint32_t)'i' << 16 | (uint32_t)'T' << 8 |            \
    (uint32_t)'D')
 #define LLVM_PERF_JIT_VERSION 1
+
+// bit 0: set if the jitdump file is using an architecture-specific timestamp
+// clock source
+#define JITDUMP_FLAGS_ARCH_TIMESTAMP (1ULL << 0)
 
 using namespace llvm;
 using namespace llvm::orc;
@@ -56,6 +65,9 @@ struct PerfState {
 
   // perf mmap marker
   void *MarkerAddr = nullptr;
+
+  // Whether to use the architecture-specific timestamp clock source.
+  bool UseArchTimestamp = false;
 };
 
 // prevent concurrent dumps from messing up the output file
@@ -102,7 +114,15 @@ static inline uint64_t timespec_to_ns(const struct timespec *TS) {
   return ((uint64_t)TS->tv_sec * NanoSecPerSec) + TS->tv_nsec;
 }
 
-static inline uint64_t perf_get_timestamp() {
+static inline uint64_t perf_get_timestamp(bool UseArchTimestamp) {
+  if (UseArchTimestamp) {
+#if defined(__i386__) || defined(__x86_64__)
+    return __rdtsc();
+#else
+    return 0;
+#endif
+  }
+
   timespec TS;
   if (clock_gettime(CLOCK_MONOTONIC, &TS))
     return 0;
@@ -116,7 +136,8 @@ static void writeDebugRecord(const PerfJITDebugInfoRecord &DebugRecord) {
                     << DebugRecord.Entries.size() << " entries\n");
   [[maybe_unused]] size_t Written = 0;
   DIR Dir{RecHeader{static_cast<uint32_t>(DebugRecord.Prefix.Id),
-                    DebugRecord.Prefix.TotalSize, perf_get_timestamp()},
+                    DebugRecord.Prefix.TotalSize,
+                    perf_get_timestamp(State->UseArchTimestamp)},
           DebugRecord.CodeAddr, DebugRecord.Entries.size()};
   State->Dumpstream->write(reinterpret_cast<const char *>(&Dir), sizeof(Dir));
   Written += sizeof(Dir);
@@ -136,7 +157,8 @@ static void writeCodeRecord(const PerfJITCodeLoadRecord &CodeRecord) {
                     << CodeRecord.CodeSize << " and code index "
                     << CodeRecord.CodeIndex << "\n");
   CLR Clr{RecHeader{static_cast<uint32_t>(CodeRecord.Prefix.Id),
-                    CodeRecord.Prefix.TotalSize, perf_get_timestamp()},
+                    CodeRecord.Prefix.TotalSize,
+                    perf_get_timestamp(State->UseArchTimestamp)},
           State->Pid,
           Tid,
           CodeRecord.Vma,
@@ -161,7 +183,8 @@ writeUnwindRecord(const PerfJITCodeUnwindingInfoRecord &UnwindRecord) {
                     << UnwindRecord.EHFrameHdrSize << " and mapped size "
                     << UnwindRecord.MappedSize << "\n");
   UWR Uwr{RecHeader{static_cast<uint32_t>(UnwindRecord.Prefix.Id),
-                    UnwindRecord.Prefix.TotalSize, perf_get_timestamp()},
+                    UnwindRecord.Prefix.TotalSize,
+                    perf_get_timestamp(State->UseArchTimestamp)},
           UnwindRecord.UnwindDataSize, UnwindRecord.EHFrameHdrSize,
           UnwindRecord.MappedSize};
   LLVM_DEBUG(dbgs() << "wrote " << sizeof(Uwr) << " bytes of UWR, "
@@ -247,7 +270,8 @@ static Expected<Header> FillMachine(PerfState &State) {
   Hdr.Version = LLVM_PERF_JIT_VERSION;
   Hdr.TotalSize = sizeof(Hdr);
   Hdr.Pid = State.Pid;
-  Hdr.Timestamp = perf_get_timestamp();
+  Hdr.Timestamp = perf_get_timestamp(State.UseArchTimestamp);
+  Hdr.Flags = State.UseArchTimestamp ? JITDUMP_FLAGS_ARCH_TIMESTAMP : 0;
 
   char Id[16];
   struct {
@@ -331,8 +355,19 @@ static Error InitDebuggingDir(PerfState &State) {
 static Error registerJITLoaderPerfStartImpl() {
   PerfState Tentative;
   Tentative.Pid = sys::Process::getProcessId();
-  // check if clock-source is supported
-  if (!perf_get_timestamp())
+
+  if (const char *UseArchTimestampEnv = getenv("JITDUMP_USE_ARCH_TIMESTAMP")) {
+    if (strcmp(UseArchTimestampEnv, "1") == 0) {
+      if (!perf_get_timestamp(true))
+        return make_error<StringError>(
+            "architecture-specific timestamp source is not available",
+            inconvertibleErrorCode());
+      Tentative.UseArchTimestamp = true;
+    }
+  }
+
+  // Check if the selected clock source is supported.
+  if (!Tentative.UseArchTimestamp && !perf_get_timestamp(false))
     return make_error<StringError>("kernel does not support CLOCK_MONOTONIC",
                                    inconvertibleErrorCode());
 
@@ -386,7 +421,7 @@ static Error registerJITLoaderPerfEndImpl() {
   RecHeader Close;
   Close.Id = static_cast<uint32_t>(PerfJITRecordType::JIT_CODE_CLOSE);
   Close.TotalSize = sizeof(Close);
-  Close.Timestamp = perf_get_timestamp();
+  Close.Timestamp = perf_get_timestamp(State->UseArchTimestamp);
   State->Dumpstream->write(reinterpret_cast<const char *>(&Close),
                            sizeof(Close));
   if (State->MarkerAddr)
